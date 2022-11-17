@@ -1,0 +1,155 @@
+version: 2.1
+
+parameters:
+  DEFAULT_EXECUTOR:
+    type: string
+    default: "docker_toolbox"
+  DEFAULT_CONTEXT:
+    type: string
+    default: "aws-baseline"
+  AWS_ROLE_ARN_DEV:
+    type: string
+    default: "arn:aws:iam::xxxxxxxxxxxx:role/circle_dev_access_role"
+
+orbs:
+  aws-cli: circleci/aws-cli@3.1
+
+executors:
+  docker_toolbox:
+    parameters:
+      AWS_ROLE_ARN:
+        type: string
+        default: ""
+      AWS_S3_BACKEND:
+        type: string
+        default: ""
+    environment:
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ROLE_ARN: << parameters.AWS_ROLE_ARN >>
+      AWS_S3_BACKEND: << parameters.AWS_S3_BACKEND >>
+    docker:
+      - image: cimg/deploy:2022.11
+
+commands:
+  aws_oidc_setup:
+    description: Setup AWS auth using OIDC token
+    steps:
+      - aws-cli/install:
+          disable-aws-pager: true
+          override-installed: true
+      - run:
+          name: Get short-term credentials
+          command: |
+            STS=($(aws sts assume-role-with-web-identity \
+            --role-arn ${AWS_ROLE_ARN} \
+            --role-session-name "CircleCI-${CIRCLE_PROJECT_REPONAME}" \
+            --web-identity-token ${CIRCLE_OIDC_TOKEN} \
+            --duration-seconds 1800 \
+            --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+            --output text))
+            echo "export AWS_ACCESS_KEY_ID=${STS[0]}" >> ${BASH_ENV}
+            echo "export AWS_SECRET_ACCESS_KEY=${STS[1]}" >> ${BASH_ENV}
+            echo "export AWS_SESSION_TOKEN=${STS[2]}" >> ${BASH_ENV}
+            source ${BASH_ENV}
+
+  aws_tf_init:
+    description: Init AWS Terraform
+    steps:
+      - checkout
+      - run:
+          name: Terraform init & validate
+          command: |
+            cd terraform
+            terraform fmt -check=true -list=true -diff=true
+            terraform init -input=false -backend-config="bucket=${AWS_S3_BACKEND}"
+            terraform validate
+      - persist_to_workspace:
+          root: .
+          paths:
+            - .
+
+  aws_tf_plan:
+    description: Save the AWS Terraform plan
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: Terraform plan
+          command: |
+            cd terraform
+            terraform plan -out tfapply
+      - persist_to_workspace:
+          root: .
+          paths:
+            - ./terraform/tfapply
+
+  aws_tf_apply:
+    description: Apply AWS Terraform plan
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: Terraform apply plan
+          command: |
+            cd terraform
+            terraform apply -auto-approve tfapply
+
+jobs:
+  tf_init:
+    parameters:
+      exec:
+        type: executor
+    executor: << parameters.exec >>
+    steps:
+      - aws_oidc_setup
+      - aws_tf_init
+
+  tf_plan:
+    parameters:
+      exec:
+        type: executor
+    executor: << parameters.exec >>
+    steps:
+      - aws_oidc_setup
+      - aws_tf_plan
+
+  tf_apply:
+    parameters:
+      exec:
+        type: executor
+    executor: << parameters.exec >>
+    steps:
+      - aws_oidc_setup
+      - aws_tf_apply
+
+workflows:
+  version: 2
+  tf_deploy:
+    jobs:
+      # Run for DEV account
+      - tf_init:
+          name: tf_init_dev
+          context: << pipeline.parameters.DEFAULT_CONTEXT >>
+          exec:
+            name: << pipeline.parameters.DEFAULT_EXECUTOR >>
+            AWS_ROLE_ARN: << pipeline.parameters.AWS_ROLE_ARN_DEV >>
+            AWS_S3_BACKEND: <bucket-prefix>-<project-name>-tfstate
+      - tf_plan:
+          name: tf_plan_dev
+          context: << pipeline.parameters.DEFAULT_CONTEXT >>
+          requires:
+            - tf_init_dev
+          exec:
+            name: << pipeline.parameters.DEFAULT_EXECUTOR >>
+            AWS_ROLE_ARN: << pipeline.parameters.AWS_ROLE_ARN_DEV >>
+      - tf_apply:
+          name: tf_apply_dev
+          context: << pipeline.parameters.DEFAULT_CONTEXT >>
+          requires:
+            - tf_plan_dev
+          filters:
+            branches:
+              only: main
+          exec:
+            name: << pipeline.parameters.DEFAULT_EXECUTOR >>
+            AWS_ROLE_ARN: << pipeline.parameters.AWS_ROLE_ARN_DEV >>
